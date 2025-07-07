@@ -1,0 +1,29 @@
+name: medantrix_app
+description: A medical device monitoring application
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+  flutter: ">=3.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  provider: ^6.1.1
+  flutter_blue_plus: ^1.32.7
+  permission_handler: ^11.3.1
+  cupertino_icons: ^1.0.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.3
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/medantrik_logo.png
+    - assets/images/medantrik_logo1.png
+
