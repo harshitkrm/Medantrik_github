@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'dart:convert';
+import 'dart:typed_data'; // Added for ByteData
+import 'dart:convert'; // Added for utf8
 
 // Platform-specific imports
 import 'package:permission_handler/permission_handler.dart';
@@ -127,17 +129,22 @@ void main() async {
 
   if (!kIsWeb) {
     try {
+      await Permission.location.request();
+      await Permission.bluetooth.request();
       await Permission.bluetoothScan.request();
       await Permission.bluetoothConnect.request();
-      await Permission.location.request();
+      await Permission.locationWhenInUse.request();
     } catch (e) {
       debugPrint('Error requesting permissions: $e');
     }
   }
 
   runApp(
-    ChangeNotifierProvider(
-      create: (_) => BluetoothStateProvider(),
+    MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => BluetoothStateProvider()),
+        ChangeNotifierProvider(create: (_) => BluetoothDataProvider()),
+      ],
       child: const MyApp(),
     ),
   );
@@ -146,65 +153,81 @@ void main() async {
 class BluetoothStateProvider extends ChangeNotifier {
   bool _isScanning = false;
   dynamic _connectedDevice;
-  final List<dynamic> _scanResults = [];
+  List<ScanResult> _scanResults = [];
   StreamSubscription<List<ScanResult>>? _scanSubscription;
   StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
+  StreamSubscription<List<int>>? _cmdNotificationSubscription;
 
   bool get isScanning => _isScanning;
   dynamic get connectedDevice => _connectedDevice;
   List<dynamic> get scanResults => List.unmodifiable(_scanResults);
 
-  Future<void> startScan([BuildContext? context]) async {
-    debugPrint('Scan button pressed');
-    if (kIsWeb) {
-      debugPrint('Bluetooth scanning is not supported on web platform');
-      return;
-    }
+  Future<void> startScan() async {
+    _isScanning=true;
+    _scanResults.clear();
+    notifyListeners();
 
-    if (_isScanning) return;
-
-    // Check location permission before scanning
-    if (context != null) {
-      final granted = await ensureLocationPermission(context);
-      if (!granted) return;
-      final btOn = await ensureBluetoothOn(context);
-      if (!btOn) return;
-    }
-
-    try {
-      _scanResults.clear();
-      _isScanning = true;
+    FlutterBluePlus.scanResults.listen((results) {
+      _scanResults = results;
       notifyListeners();
+    });
 
-      // Cancel previous subscription if exists
-      await _scanSubscription?.cancel();
-
-      // Listen to scan results
-      _scanSubscription = FlutterBluePlus.scanResults.listen((results) {
-        print('Scan results: \\n' + results.map((r) => r.device.platformName).join(', '));
-        _scanResults
-          ..clear()
-          ..addAll(results);
-        notifyListeners();
-      });
-
-      // Start scanning
-      await FlutterBluePlus.startScan(
-        timeout: const Duration(seconds: 10),
-        androidUsesFineLocation: true,
-      );
-    } catch (e) {
-      debugPrint('Error scanning: $e');
-    } finally {
-      _isScanning = false;
-      notifyListeners();
-      try {
-        await FlutterBluePlus.stopScan();
-      } catch (e) {
-        debugPrint('Error stopping scan: $e');
-      }
-    }
+    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
+    _isScanning = false;
+    notifyListeners();
   }
+
+  // Future<void> startScan([BuildContext? context]) async {
+  //   debugPrint('Scan button pressed');
+  //   if (kIsWeb) {
+  //     debugPrint('Bluetooth scanning is not supported on web platform');
+  //     return;
+  //   }
+  //
+  //   if (_isScanning) return;
+  //
+  //   // Check location permission before scanning
+  //   if (context != null) {
+  //     final granted = await ensureLocationPermission(context);
+  //     if (!granted) return;
+  //     final btOn = await ensureBluetoothOn(context);
+  //     if (!btOn) return;
+  //   }
+  //
+  //   try {
+  //     _scanResults.clear();
+  //     _isScanning = true;
+  //     notifyListeners();
+  //
+  //     // Cancel previous subscription if exists
+  //     await _scanSubscription?.cancel();
+  //
+  //     // Listen to scan results
+  //     _scanSubscription = FlutterBluePlus.scanResults.listen((results) {
+  //       print('Scan results: \\n${results.map((r) => r.device.platformName).join(', ')}');
+  //       _scanResults
+  //         ..clear()
+  //         ..addAll(results);
+  //       notifyListeners();
+  //     });
+  //
+  //     // Start scanning
+  //     await FlutterBluePlus.startScan(
+  //       timeout: const Duration(seconds: 10),
+  //       androidUsesFineLocation: true,
+  //     );
+  //   } catch (e) {
+  //     debugPrint('Error scanning: $e');
+  //   } finally {
+  //     _isScanning = false;
+  //     notifyListeners();
+  //     try {
+  //       await FlutterBluePlus.stopScan();
+  //     } catch (e) {
+  //       debugPrint('Error stopping scan: $e');
+  //     }
+  //   }
+  // }
 
   Future<void> connectToDevice(dynamic device) async {
     if (kIsWeb) return;
@@ -212,6 +235,7 @@ class BluetoothStateProvider extends ChangeNotifier {
     try {
       // Cancel previous connection subscription
       await _connectionSubscription?.cancel();
+      await _cmdNotificationSubscription?.cancel();
 
       final bluetoothDevice = device as BluetoothDevice;
 
@@ -219,7 +243,11 @@ class BluetoothStateProvider extends ChangeNotifier {
       _connectionSubscription = bluetoothDevice.connectionState.listen((state) {
         if (state == BluetoothConnectionState.disconnected) {
           _connectedDevice = null;
+          _cmdNotificationSubscription?.cancel();
           notifyListeners();
+          // Clear readings on disconnect
+          final dataProvider = Provider.of<BluetoothDataProvider>(navigatorKey.currentContext!, listen: false);
+          dataProvider.clearAllReadings();
         }
       });
 
@@ -227,6 +255,16 @@ class BluetoothStateProvider extends ChangeNotifier {
       await bluetoothDevice.connect();
       _connectedDevice = bluetoothDevice;
       notifyListeners();
+
+      // Subscribe to CMD notifications after connecting
+      await subscribeToCmdNotifications(bluetoothDevice);
+
+      // Clear readings on new connection
+      final dataProvider = Provider.of<BluetoothDataProvider>(navigatorKey.currentContext!, listen: false);
+      dataProvider.clearAllReadings();
+
+      // Automatically subscribe to notifications for all relevant sensor characteristics
+      await subscribeToSensorNotifications(bluetoothDevice);
     } catch (e) {
       debugPrint('Error connecting to device: $e');
     }
@@ -240,9 +278,78 @@ class BluetoothStateProvider extends ChangeNotifier {
         await (_connectedDevice as BluetoothDevice).disconnect();
       }
       _connectedDevice = null;
+      await _cmdNotificationSubscription?.cancel();
       notifyListeners();
     } catch (e) {
       debugPrint('Error disconnecting: $e');
+    }
+  }
+
+  Future<void> subscribeToCmdNotifications(BluetoothDevice device) async {
+    final dataProvider = Provider.of<BluetoothDataProvider>(navigatorKey.currentContext!, listen: false);
+    final services = await device.discoverServices();
+    for (var service in services) {
+      for (var characteristic in service.characteristics) {
+        if (characteristic.uuid.toString().toLowerCase() == bleCharacteristicUuids['CMD']?.toLowerCase()) {
+          await characteristic.setNotifyValue(true);
+          _cmdNotificationSubscription = characteristic.value.listen((value) {
+            final notification = utf8.decode(value);
+            dataProvider.setLastCmdNotification(notification);
+            // Show SnackBar with notification if on DevicePage
+            final context = navigatorKey.currentContext;
+            if (context != null) {
+              final snackText = (notification.isEmpty)
+                  ? 'No data received from device.'
+                  : 'CMD Notification: $notification';
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text(snackText)),
+              );
+            }
+          });
+        }
+      }
+    }
+  }
+
+  // Subscribe to notifications for all sensor characteristics
+  Future<void> subscribeToSensorNotifications(BluetoothDevice device) async {
+    final dataProvider = Provider.of<BluetoothDataProvider>(navigatorKey.currentContext!, listen: false);
+    final services = await device.discoverServices();
+    final Map<String, String> uuidToType = {
+      bleCharacteristicUuids['TEMP1']!.toLowerCase(): 'TEMP1',
+      bleCharacteristicUuids['TEMP2']!.toLowerCase(): 'TEMP2',
+      bleCharacteristicUuids['SOC']!.toLowerCase(): 'SOC',
+      bleCharacteristicUuids['PRES']!.toLowerCase(): 'PRES',
+      bleCharacteristicUuids['RPS']!.toLowerCase(): 'RPS',
+      // Add SPO2 if you have a UUID for it
+    };
+    for (var service in services) {
+      for (var characteristic in service.characteristics) {
+        final uuid = characteristic.uuid.toString().toLowerCase();
+        if (uuidToType.containsKey(uuid)) {
+          await characteristic.setNotifyValue(true);
+          characteristic.value.listen((value) {
+            String reading = '';
+            if (value.isNotEmpty) {
+              // Try to decode as float, int, or string
+              if (value.length == 4) {
+                // Try float
+                final byteData = ByteData.sublistView(Uint8List.fromList(value));
+                reading = byteData.getFloat32(0, Endian.little).toStringAsFixed(2);
+              } else if (value.length == 1) {
+                reading = value[0].toString();
+              } else {
+                try {
+                  reading = utf8.decode(value);
+                } catch (_) {
+                  reading = value.toString();
+                }
+              }
+            }
+            dataProvider.setLastReading(_connectedDevice?.platformName ?? '', uuidToType[uuid]!, reading);
+          });
+        }
+      }
     }
   }
 
@@ -250,12 +357,20 @@ class BluetoothStateProvider extends ChangeNotifier {
   void dispose() {
     _scanSubscription?.cancel();
     _connectionSubscription?.cancel();
+    _cmdNotificationSubscription?.cancel();
     super.dispose();
   }
 }
 
 class BluetoothDataProvider extends ChangeNotifier {
   Map<String, String> _lastReadings = {};
+  String? _lastCmdNotification;
+
+  String? get lastCmdNotification => _lastCmdNotification;
+  void setLastCmdNotification(String value) {
+    _lastCmdNotification = value;
+    notifyListeners();
+  }
 
   String? getLastReading(String deviceName, String measurementType) {
     return _lastReadings['${deviceName}_$measurementType'];
@@ -281,6 +396,11 @@ class BluetoothDataProvider extends ChangeNotifier {
     _lastReadings['${deviceName}_$measurementType'] = reading;
     notifyListeners();
     return reading;
+  }
+
+  void clearAllReadings() {
+    _lastReadings.clear();
+    notifyListeners();
   }
 }
 
@@ -331,6 +451,9 @@ class MedantrikLogo extends StatelessWidget {
   }
 }
 
+// Add a global navigator key for context access in provider
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
@@ -342,17 +465,42 @@ class MyApp extends StatelessWidget {
         primarySwatch: Colors.blue,
         useMaterial3: true,
       ),
-      home: const LoginPage(),
+      navigatorKey: navigatorKey,
+      home: const HomePage(userEmail: '',userName: '',),
     );
   }
 }
 
-class BluetoothHomePage extends StatelessWidget {
+class BluetoothHomePage extends StatefulWidget {
   const BluetoothHomePage({super.key});
 
   @override
+  State<BluetoothHomePage> createState() => _BluetoothHomePageState();
+}
+
+class _BluetoothHomePageState extends State<BluetoothHomePage> {
+  @override
   Widget build(BuildContext context) {
     final bluetoothState = Provider.of<BluetoothStateProvider>(context);
+    // bool isScanning = false;
+    // List<ScanResult> scanResults = [];
+    // BluetoothDevice? connectedDevice;
+
+    // void startScan() async {
+    //   setState(() {
+    //     isScanning = true;
+    //     scanResults.clear();
+    //   });
+    //
+    //   FlutterBluePlus.scanResults.listen((results) {
+    //     setState(() {
+    //       scanResults = results;
+    //     });
+    //   });
+    //
+    //   await FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
+    //   setState(() => isScanning = false);
+    // }
 
     return Scaffold(
       appBar: AppBar(
@@ -420,7 +568,8 @@ class BluetoothHomePage extends StatelessWidget {
               ElevatedButton.icon(
                 onPressed: bluetoothState.isScanning
                     ? null
-                    : () => bluetoothState.startScan(context),
+                    : () => bluetoothState.startScan(),
+                // onPressed: ()=>startScan(),
                 icon: const Icon(Icons.bluetooth_searching),
                 label: Text(bluetoothState.isScanning
                     ? 'Scanning...'
@@ -437,7 +586,8 @@ class BluetoothHomePage extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 8),
-              Expanded(
+              SizedBox(
+                height: 300, // Set a max height for the list to avoid overflow
                 child: bluetoothState.scanResults.isEmpty
                     ? const Center(
                         child: Text(
@@ -449,6 +599,7 @@ class BluetoothHomePage extends StatelessWidget {
                         ),
                       )
                     : ListView.builder(
+                        shrinkWrap: true,
                         itemCount: bluetoothState.scanResults.length,
                         itemBuilder: (context, index) {
                           final result = bluetoothState.scanResults[index];
@@ -861,18 +1012,28 @@ class BluetoothDialog extends StatelessWidget {
                   child: Text('No devices found'),
                 )
               else
-                ...state.scanResults.map((result) => ListTile(
-                      leading: const Icon(Icons.bluetooth),
-                      title: Text(result.device.platformName.isNotEmpty
-                          ? result.device.platformName
-                          : "(Unnamed Device)"),
-                      subtitle: Text(result.device.remoteId.toString()),
-                      trailing: Text('${result.rssi} dBm'),
-                      onTap: () async {
-                        Navigator.pop(context);
-                        await state.connectToDevice(result.device);
-                      },
-                    )),
+                SizedBox(
+                  height: 300, // Set a max height for the list to avoid overflow
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: state.scanResults.length,
+                    itemBuilder: (context, index) {
+                      final result = state.scanResults[index];
+                      return ListTile(
+                        leading: const Icon(Icons.bluetooth),
+                        title: Text(result.device.platformName.isNotEmpty
+                            ? result.device.platformName
+                            : "(Unnamed Device)"),
+                        subtitle: Text(result.device.remoteId.toString()),
+                        trailing: Text('${result.rssi} dBm'),
+                        onTap: () async {
+                          Navigator.pop(context);
+                          await state.connectToDevice(result.device);
+                        },
+                      );
+                    },
+                  ),
+                ),
               const SizedBox(height: 16),
               ElevatedButton.icon(
                 onPressed: state.isScanning ? null : () => state.startScan(),
@@ -921,9 +1082,49 @@ Future<void> writeBleCommand(BluetoothDevice device, int command) async {
   }
 }
 
-class DevicePage extends StatelessWidget {
+class DevicePage extends StatefulWidget {
   final String deviceName;
   const DevicePage({super.key, required this.deviceName});
+
+  @override
+  State<DevicePage> createState() => _DevicePageState();
+}
+
+class _DevicePageState extends State<DevicePage> {
+  late TextEditingController _cmdController;
+  late TextEditingController _clientCharController;
+
+  @override
+  void initState() {
+    super.initState();
+    _cmdController = TextEditingController(text: '1');
+    _clientCharController = TextEditingController(text: '1');
+  }
+
+  @override
+  void dispose() {
+    _cmdController.dispose();
+    _clientCharController.dispose();
+    super.dispose();
+  }
+
+  String getUnit(String type) {
+    switch (type) {
+      case 'TEMP1':
+      case 'TEMP2':
+        return '°C';
+      case 'SOC':
+        return '%';
+      case 'PRES':
+        return 'hPa';
+      case 'RPS':
+        return 'RPS';
+      case 'SPO2':
+        return '%';
+      default:
+        return '';
+    }
+  }
 
   Widget _buildMeasurementButton({
     required BuildContext context,
@@ -931,7 +1132,7 @@ class DevicePage extends StatelessWidget {
     required String buttonText,
   }) {
     final dataProvider = Provider.of<BluetoothDataProvider>(context);
-    final lastReading = dataProvider.getLastReading(deviceName, type);
+    final lastReading = dataProvider.getLastReading(widget.deviceName, type);
     final bluetoothState = Provider.of<BluetoothStateProvider>(context, listen: false);
 
     return Row(
@@ -943,13 +1144,10 @@ class DevicePage extends StatelessWidget {
               if (bluetoothState.connectedDevice != null && !kIsWeb) {
                 reading = await readBleCharacteristic(bluetoothState.connectedDevice, type);
               } else {
-                reading = await dataProvider.fetchReading(deviceName, type);
+                reading = await dataProvider.fetchReading(widget.deviceName, type);
               }
-              if (context.mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text('New $type reading: $reading')),
-                );
-              }
+              final readingWithUnit = '$reading ${getUnit(type)}'.trim();
+              dataProvider.setLastReading(widget.deviceName, type, readingWithUnit);
             },
             style: ElevatedButton.styleFrom(
               padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
@@ -965,7 +1163,7 @@ class DevicePage extends StatelessWidget {
             borderRadius: BorderRadius.circular(8),
           ),
           child: Text(
-            lastReading ?? 'No data',
+            (lastReading != null && lastReading.isNotEmpty) ? lastReading : 'No data',
             style: const TextStyle(
               fontSize: 18,
               fontWeight: FontWeight.bold,
@@ -977,9 +1175,70 @@ class DevicePage extends StatelessWidget {
     );
   }
 
+  Widget _buildUuidInputButton({
+    required BuildContext context,
+    required String uuid,
+    required String label,
+    required TextEditingController controller,
+  }) {
+    final bluetoothState = Provider.of<BluetoothStateProvider>(context, listen: false);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: Row(
+        children: [
+          Expanded(
+            flex: 2,
+            child: Text(label, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            flex: 3,
+            child: TextField(
+              controller: controller,
+              enabled: bluetoothState.connectedDevice != null && !kIsWeb,
+              decoration: const InputDecoration(
+                hintText: 'Enter value',
+                border: OutlineInputBorder(),
+                contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          ElevatedButton(
+            onPressed: bluetoothState.connectedDevice == null || kIsWeb
+                ? null
+                : () async {
+                    final value = controller.text.trim();
+                    if (value.isNotEmpty) {
+                      final device = bluetoothState.connectedDevice;
+                      final services = await device.discoverServices();
+                      for (var service in services) {
+                        for (var characteristic in service.characteristics) {
+                          if (characteristic.uuid.toString().toLowerCase() == uuid.toLowerCase()) {
+                            // If value is an integer, send as a single byte. Otherwise, send as utf8 string.
+                            final intVal = int.tryParse(value);
+                            if (intVal != null) {
+                              await characteristic.write([intVal]);
+                            } else {
+                              await characteristic.write(utf8.encode(value));
+                            }
+                          }
+                        }
+                      }
+                      controller.clear();
+                    }
+                  },
+            child: const Text('Send'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final bluetoothState = Provider.of<BluetoothStateProvider>(context);
+    final dataProvider = Provider.of<BluetoothDataProvider>(context);
     return Scaffold(
       appBar: AppBar(
         title: const Padding(
@@ -988,6 +1247,19 @@ class DevicePage extends StatelessWidget {
         ),
         centerTitle: true,
         toolbarHeight: 80,
+        actions: [
+          if (bluetoothState.connectedDevice != null && !kIsWeb)
+            IconButton(
+              icon: const Icon(Icons.bluetooth_disabled, color: Colors.red),
+              tooltip: 'Disconnect',
+              onPressed: () async {
+                await bluetoothState.disconnectDevice();
+                if (context.mounted) {
+                  Navigator.pop(context);
+                }
+              },
+            ),
+        ],
       ),
       body: Stack(
         children: [
@@ -1002,83 +1274,92 @@ class DevicePage extends StatelessWidget {
             ),
           ),
           // Main content
-          Padding(
-            padding: const EdgeInsets.all(24.0),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Text(
-                  deviceName,
-                  style: const TextStyle(
-                      fontSize: 24, fontWeight: FontWeight.bold),
-                  textAlign: TextAlign.center,
-                ),
-                const SizedBox(height: 32),
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(16.0),
-                    child: Column(
-                      children: [
-                        _buildMeasurementButton(
-                          context: context,
-                          type: 'TEMP1',
-                          buttonText: 'Get Temperature 1',
+          SingleChildScrollView(
+            child: Padding(
+              padding: const EdgeInsets.all(24.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    widget.deviceName,
+                    style: const TextStyle(
+                        fontSize: 24, fontWeight: FontWeight.bold),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 16),
+                  if (dataProvider.lastCmdNotification != null && dataProvider.lastCmdNotification!.isNotEmpty)
+                    Card(
+                      color: Colors.yellow[100],
+                      child: Padding(
+                        padding: const EdgeInsets.all(12.0),
+                        child: Text(
+                          'Device Status: ${dataProvider.lastCmdNotification}',
+                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                          textAlign: TextAlign.center,
                         ),
-                        const SizedBox(height: 16),
-                        _buildMeasurementButton(
-                          context: context,
-                          type: 'SOC',
-                          buttonText: 'Get Battery SOC',
-                        ),
-                        const SizedBox(height: 16),
-                        _buildMeasurementButton(
-                          context: context,
-                          type: 'PRES',
-                          buttonText: 'Get Atmospheric Pressure',
-                        ),
-                        const SizedBox(height: 16),
-                        _buildMeasurementButton(
-                          context: context,
-                          type: 'RPS',
-                          buttonText: 'Get Heart Beat (RPS)',
-                        ),
-                        const SizedBox(height: 16),
-                        _buildMeasurementButton(
-                          context: context,
-                          type: 'TEMP2',
-                          buttonText: 'Get Temperature 2',
-                        ),
-                        const SizedBox(height: 16),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: ElevatedButton(
-                                onPressed: bluetoothState.connectedDevice == null || kIsWeb
-                                    ? null
-                                    : () => writeBleCommand(bluetoothState.connectedDevice, 2),
-                                child: const Text('Start Test'),
-                              ),
-                            ),
-                            const SizedBox(width: 16),
-                            Expanded(
-                              child: ElevatedButton(
-                                onPressed: bluetoothState.connectedDevice == null || kIsWeb
-                                    ? null
-                                    : () => writeBleCommand(bluetoothState.connectedDevice, 3),
-                                child: const Text('Stop Test'),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
+                      ),
+                    ),
+                  const SizedBox(height: 32),
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16.0),
+                      child: Column(
+                        children: [
+                          _buildMeasurementButton(
+                            context: context,
+                            type: 'TEMP1',
+                            buttonText: 'Get Temperature 1',
+                          ),
+                          const SizedBox(height: 16),
+                          _buildMeasurementButton(
+                            context: context,
+                            type: 'SOC',
+                            buttonText: 'Get Battery SOC',
+                          ),
+                          const SizedBox(height: 16),
+                          _buildMeasurementButton(
+                            context: context,
+                            type: 'PRES',
+                            buttonText: 'Get Atmospheric Pressure',
+                          ),
+                          const SizedBox(height: 16),
+                          _buildMeasurementButton(
+                            context: context,
+                            type: 'RPS',
+                            buttonText: 'Get Heart Beat (RPS)',
+                          ),
+                          const SizedBox(height: 16),
+                          _buildMeasurementButton(
+                            context: context,
+                            type: 'TEMP2',
+                            buttonText: 'Get Temperature 2',
+                          ),
+                          const SizedBox(height: 16),
+                          // Input for CMD Characteristic
+                          _buildUuidInputButton(
+                            context: context,
+                            uuid: 'ad1c9cca-f2a8-4a5d-8cbe-6626ebb7ab0a',
+                            label: 'Send to CMD Characteristic',
+                            controller: _cmdController,
+                          ),
+                          const SizedBox(height: 16),
+                        ],
+                      ),
                     ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ],
       ),
     );
+  }
+}
+
+extension BluetoothDataProviderExtension on BluetoothDataProvider {
+  void setLastReading(String deviceName, String measurementType, String value) {
+    _lastReadings['${deviceName}_$measurementType'] = value;
+    notifyListeners();
   }
 }
